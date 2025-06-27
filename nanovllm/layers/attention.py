@@ -75,8 +75,6 @@ class Attention(nn.Module):
             # # Call your custom prefill kernel
             o = variable_length_attention(q, k, v,
                                         cu_seqlens=context.cu_seqlens_q,
-                                        block_table=context.block_tables,
-                                        max_seqlen=context.max_seqlen_q,
                                         scale=self.scale)
 
         else:    # decode
