@@ -12,6 +12,7 @@ constexpr int TILE_SIZE_K = 16;
 constexpr int BLOCK_THREADS = 128;
 
 namespace { // Use an anonymous namespace to limit symbol visibility and prevent linkage errors.
+constexpr int BLOCK_DIM_X = 32;
 
 // --- KERNEL IMPLEMENTATION: Paged Attention (Decode) ---
 template <typename T>
@@ -73,23 +74,43 @@ __global__ void paged_attention_kernel(
                     score += static_cast<float>(q_tile[j]) * static_cast<float>(k_tile[i * head_dim + j]);
                 }
                 scores[i] = score * scale;
+            } else {
+                scores[i] = -FLT_MAX;
             }
         }
         __syncthreads();
 
+        // Manual block-wide reduction to find the tile's max score
+        __shared__ float reduction_mem[BLOCK_THREADS];
+        float thread_max = -FLT_MAX;
+        for (int i = threadIdx.x; i < TILE_SIZE_K; i += blockDim.x) {
+            thread_max = max(thread_max, scores[i]);
+        }
+        reduction_mem[threadIdx.x] = thread_max;
+        __syncthreads();
+
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) {
+                reduction_mem[threadIdx.x] = max(reduction_mem[threadIdx.x], reduction_mem[threadIdx.x + s]);
+            }
+            __syncthreads();
+        }
+        float tile_max = reduction_mem[0];
+        
+        // Update global max and scale accumulator
         float old_max = max_score;
-        for (int i = 0; i < TILE_SIZE_K; ++i) {
-            if (k_start + i < seq_len && scores[i] > max_score) {
-                max_score = scores[i];
-            }
-        }
+        max_score = max(max_score, tile_max);
+        
         if (old_max > -FLT_MAX) {
-             sum_exp *= expf(old_max - max_score);
-             for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-                acc_tile[i] *= expf(old_max - max_score);
+            float scale_factor = expf(old_max - max_score);
+            sum_exp *= scale_factor;
+            for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+                acc_tile[i] *= scale_factor;
             }
         }
-       
+        __syncthreads();
+
+        // Load V tile
         for (int i = threadIdx.x; i < TILE_SIZE_K * head_dim; i += blockDim.x) {
              int token_idx = k_start + (i / head_dim);
             int dim_idx = i % head_dim;
@@ -102,6 +123,7 @@ __global__ void paged_attention_kernel(
         }
         __syncthreads();
 
+        // Accumulate
         for (int i = 0; i < TILE_SIZE_K; ++i) {
             if (k_start + i < seq_len) {
                 float current_exp = expf(scores[i] - max_score);
@@ -154,6 +176,12 @@ __global__ void variable_length_attention_kernel(
     float* acc_tile = reinterpret_cast<float*>(smem + TILE_SIZE_Q * head_dim * sizeof(T));
     T* k_tile = reinterpret_cast<T*>(smem + TILE_SIZE_Q * head_dim * sizeof(T) + TILE_SIZE_Q * head_dim * sizeof(float));
     T* v_tile = reinterpret_cast<T*>(k_tile + TILE_SIZE_K * head_dim);
+    // Shared memory for softmax stats and communication
+    float* shared_stats = reinterpret_cast<float*>(v_tile + TILE_SIZE_K * head_dim);
+    float* max_scores = shared_stats;
+    float* sum_exps = &shared_stats[TILE_SIZE_Q];
+    float* scale_factors = &shared_stats[2 * TILE_SIZE_Q];
+    float* new_exps = &shared_stats[3 * TILE_SIZE_Q];
 
     // Each row of threads (threadIdx.y) handles one query.
     // Load Q for the current query into the correct slice of shared memory.
@@ -166,11 +194,14 @@ __global__ void variable_length_attention_kernel(
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
         current_acc[i] = 0.0f;
     }
-    float max_score = -FLT_MAX;
-    float sum_exp = 0.0f;
+    if (threadIdx.x == 0) {
+        max_scores[threadIdx.y] = -FLT_MAX;
+        sum_exps[threadIdx.y] = 0.0f;
+    }
     __syncthreads();
 
     for (int k_start = 0; k_start < seq_len; k_start += TILE_SIZE_K) {
+        // Load K and V tiles
         for (int i = threadIdx.x; i < TILE_SIZE_K * head_dim; i += blockDim.x) {
             int token_idx = k_start + (i / head_dim);
             int dim_idx = i % head_dim;
@@ -181,35 +212,49 @@ __global__ void variable_length_attention_kernel(
         }
         __syncthreads();
 
+        // Causal attention logic
         for (int k_local_idx = 0; k_local_idx < TILE_SIZE_K; ++k_local_idx) {
             int k_global_idx = k_start + k_local_idx;
             if (k_global_idx > q_idx_local) continue;
 
-            float score = 0.0f;
-            for (int i = 0; i < head_dim; ++i) {
-                score += static_cast<float>(current_q[i]) * static_cast<float>(k_tile[k_local_idx * head_dim + i]);
+            // Parallel dot product for the score using warp-level reduction
+            float partial_score = 0.0f;
+            for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+                partial_score += static_cast<float>(current_q[i]) * static_cast<float>(k_tile[k_local_idx * head_dim + i]);
             }
-            score *= scale;
+            
+            // Warp-level reduction
+            for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
+                partial_score += __shfl_down_sync(0xffffffff, partial_score, offset);
+            }
+            float score = partial_score; // The result is in the first thread of the warp
+            
+            // Single thread updates the stats to avoid race conditions
+            if (threadIdx.x == 0) {
+                score *= scale;
+                float old_max = max_scores[threadIdx.y];
+                float new_max = max(old_max, score);
+                max_scores[threadIdx.y] = new_max;
+                
+                scale_factors[threadIdx.y] = (old_max > -FLT_MAX) ? expf(old_max - new_max) : 1.0f;
+                new_exps[threadIdx.y] = expf(score - new_max);
+                
+                sum_exps[threadIdx.y] = sum_exps[threadIdx.y] * scale_factors[threadIdx.y] + new_exps[threadIdx.y];
+            }
+            __syncthreads();
 
-            if (score > max_score) {
-                float old_max = max_score;
-                max_score = score;
-                sum_exp *= expf(old_max - max_score);
-                for (int i = 0; i < head_dim; ++i) {
-                    current_acc[i] *= expf(old_max - max_score);
-                }
-            }
-            float current_exp = expf(score - max_score);
-            sum_exp += current_exp;
-            for (int i = 0; i < head_dim; ++i) {
-                current_acc[i] += current_exp * static_cast<float>(v_tile[k_local_idx * head_dim + i]);
+            // All threads in the row update their accumulator slice
+            float scale_factor = scale_factors[threadIdx.y];
+            float current_exp = new_exps[threadIdx.y];
+            for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+                current_acc[i] = current_acc[i] * scale_factor + current_exp * static_cast<float>(v_tile[k_local_idx * head_dim + i]);
             }
         }
         __syncthreads();
     }
 
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        out[q_idx_global * num_heads * head_dim + head_idx * head_dim + i] = static_cast<T>(current_acc[i] / sum_exp);
+        out[q_idx_global * num_heads * head_dim + head_idx * head_dim + i] = static_cast<T>(current_acc[i] / sum_exps[threadIdx.y]);
     }
 }
 
@@ -256,13 +301,13 @@ torch::Tensor variable_length_attention_template(
 
     dim3 grid( (total_tokens + TILE_SIZE_Q - 1) / TILE_SIZE_Q, num_heads);
     // Use a 2D block where threadIdx.y maps to the query in the tile
-    constexpr int BLOCK_DIM_X = 32;
     dim3 block(BLOCK_DIM_X, TILE_SIZE_Q);
 
-    size_t shared_mem_size = (TILE_SIZE_Q * head_dim * sizeof(T)) + // q_tile
-                             (TILE_SIZE_Q * head_dim * sizeof(float)) + // acc_tile
-                             (TILE_SIZE_K * head_dim * sizeof(T)) + // k_tile
-                             (TILE_SIZE_K * head_dim * sizeof(T));  // v_tile
+    size_t shared_mem_size = (TILE_SIZE_Q * head_dim * sizeof(T)) +      // q_tile
+                             (TILE_SIZE_Q * head_dim * sizeof(float)) +    // acc_tile
+                             (TILE_SIZE_K * head_dim * sizeof(T)) +      // k_tile
+                             (TILE_SIZE_K * head_dim * sizeof(T)) +      // v_tile
+                             (4 * TILE_SIZE_Q * sizeof(float));          // shared_stats
 
     variable_length_attention_kernel<T><<<grid, block, shared_mem_size>>>(
         out.data_ptr<T>(), q.data_ptr<T>(), k.data_ptr<T>(), v.data_ptr<T>(),
