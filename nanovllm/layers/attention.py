@@ -3,9 +3,17 @@ from torch import nn
 import triton
 import triton.language as tl
 
-#from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-from custom_attention_kernels import variable_length_attention, paged_attention
-from nanovllm.utils.context import get_context
+from nanovllm.utils.context import get_context, get_attention_backend
+from nanovllm.layers.pytorch_attention import pytorch_paged_attention
+
+# Conditionally import custom kernels
+try:
+    from custom_attention_kernels import variable_length_attention, paged_attention
+    _CUSTOM_KERNELS_AVAILABLE = True
+except ImportError:
+    variable_length_attention = None
+    paged_attention = None
+    _CUSTOM_KERNELS_AVAILABLE = False
 
 
 @triton.jit
@@ -55,6 +63,9 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
+        self.backend = get_attention_backend()
+        if self.backend == "custom" and not _CUSTOM_KERNELS_AVAILABLE:
+            raise ImportError("Custom attention kernels requested but not found. Please build them first.")
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         o: torch.Tensor
@@ -65,30 +76,28 @@ class Attention(nn.Module):
         k_cache = self.k_cache
         v_cache = self.v_cache
         store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+
         if context.is_prefill:
-            if context.block_tables is not None:    # prefix cache
+            # Prefill currently only supports the custom kernel
+            if self.backend != "custom":
+                raise NotImplementedError("Prefill stage requires custom kernels, which are not available.")
+            if context.block_tables is not None:  # prefix cache
                 k, v = k_cache, v_cache
-            # o = flash_attn_varlen_func(q, k, v,
-            #                            max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-            #                            max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-            #                            softmax_scale=self.scale, causal=True, block_table=context.block_tables)
-            # # Call your custom prefill kernel
             o = variable_length_attention(q, k, v,
-                                        cu_seqlens=context.cu_seqlens_q,
-                                        scale=self.scale)
-
-        else:    # decode
-            # o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-            #                             cache_seqlens=context.context_lens, block_table=context.block_tables, 
-            #                             softmax_scale=self.scale, causal=True)
-            # Call your custom prefill kernel
-# Call your custom decode kernel
-# Note: The custom kernel expects a 3D query tensor [batch, heads, dim]
-            o = paged_attention(q, k_cache, v_cache,
-                                block_table=context.block_tables,
-                                context_lens=context.context_lens,
-                                scale=self.scale)
-
+                                          cu_seqlens=context.cu_seqlens_q,
+                                          scale=self.scale)
+        else:  # decode
+            if self.backend == "custom":
+                o = paged_attention(q, k_cache, v_cache,
+                                    block_table=context.block_tables,
+                                    context_lens=context.context_lens,
+                                    scale=self.scale)
+            else: # "pytorch" backend
+                o = pytorch_paged_attention(q, k_cache, v_cache,
+                                            block_table=context.block_tables,
+                                            context_lens=context.context_lens,
+                                            scale=self.scale,
+                                            num_kv_heads=self.num_kv_heads)
 
         o = o.view(-1, self.num_heads * self.head_dim)
         return o

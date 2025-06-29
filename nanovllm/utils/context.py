@@ -25,3 +25,29 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
 def reset_context():
     global _CONTEXT
     _CONTEXT = Context()
+
+_ATTENTION_BACKEND = None
+
+def get_attention_backend():
+    """
+    Detects the fastest available attention backend.
+    Prioritizes custom CUDA kernels, then falls back to PyTorch.
+    Caches the result to avoid repeated checks.
+    """
+    global _ATTENTION_BACKEND
+    if _ATTENTION_BACKEND is not None:
+        return _ATTENTION_BACKEND
+
+    # 1. Try to import the custom kernels
+    try:
+        import custom_attention_kernels
+        _ATTENTION_BACKEND = "custom"
+        print("INFO: Using custom attention backend.")
+        return _ATTENTION_BACKEND
+    except ImportError:
+        pass
+
+    # 2. Fallback to PyTorch
+    _ATTENTION_BACKEND = "pytorch"
+    print("WARNING: Custom attention kernels not found. Falling back to slower PyTorch backend.")
+    return _ATTENTION_BACKEND
