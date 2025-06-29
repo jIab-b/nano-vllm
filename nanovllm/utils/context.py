@@ -28,6 +28,16 @@ def reset_context():
 
 _ATTENTION_BACKEND = None
 
+def set_attention_backend(backend: str):
+    """
+    Explicitly sets the attention backend.
+    Used for debugging and benchmarking.
+    """
+    global _ATTENTION_BACKEND
+    if backend not in ["pytorch", "custom"]:
+        raise ValueError(f"Unsupported attention backend: {backend}")
+    _ATTENTION_BACKEND = backend
+
 def get_attention_backend():
     """
     Detects the fastest available attention backend.

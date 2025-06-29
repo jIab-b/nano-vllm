@@ -4,7 +4,7 @@ import triton
 import triton.language as tl
 
 from nanovllm.utils.context import get_context, get_attention_backend
-from nanovllm.layers.pytorch_attention import pytorch_paged_attention
+from nanovllm.layers.pytorch_attention import pytorch_paged_attention, pytorch_variable_length_attention
 
 # Conditionally import custom kernels
 try:
@@ -78,14 +78,22 @@ class Attention(nn.Module):
         store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 
         if context.is_prefill:
-            # Prefill currently only supports the custom kernel
-            if self.backend != "custom":
-                raise NotImplementedError("Prefill stage requires custom kernels, which are not available.")
-            if context.block_tables is not None:  # prefix cache
-                k, v = k_cache, v_cache
-            o = variable_length_attention(q, k, v,
-                                          cu_seqlens=context.cu_seqlens_q,
-                                          scale=self.scale)
+            # Prefill stage
+            if self.backend == "custom":
+                if context.block_tables is not None:  # prefix cache
+                    k, v = k_cache, v_cache
+                o = variable_length_attention(q, k, v,
+                                              cu_seqlens=context.cu_seqlens_q,
+                                              scale=self.scale)
+            else: # "pytorch" backend
+                o = pytorch_variable_length_attention(
+                    q, k, v, k_cache, v_cache,
+                    cu_seqlens_q=context.cu_seqlens_q,
+                    block_tables=context.block_tables,
+                    scale=self.scale,
+                    num_q_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                )
         else:  # decode
             if self.backend == "custom":
                 o = paged_attention(q, k_cache, v_cache,
