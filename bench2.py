@@ -4,9 +4,7 @@ from random import randint, seed
 
 # Import from both libraries
 from nanovllm import LLM as NanoLLM, SamplingParams as NanoSamplingParams
-from vllm import SamplingParams as VLLMSamplingParams
-from vllm.engine.arg_utils import EngineArgs
-from vllm.engine.llm_engine import LLMEngine
+from vllm import LLM as VLLM, SamplingParams as VLLMSamplingParams
 
 
 def main():
@@ -40,43 +38,28 @@ def main():
     t_nano = (time.time() - t_nano)
     
     throughput_nano = total_tokens / t_nano
-    print(f"NanoVLLM -> Total: {total_tokens}tok, Time: {t_nano:.2f}s, Throughput: {throughput_nano:.2f}tok/s\n")
     del llm_nano
 
 
     # --- vLLM Benchmark ---
     print("--- Benchmarking vllm ---")
-    engine_args = EngineArgs(model=path, max_model_len=4096)
-    llm_vllm_engine = LLMEngine.from_engine_args(engine_args)
-    
-    # Warm-up
-    llm_vllm_engine.add_request("warmup", prompt_token_ids=[1, 2, 3], sampling_params=VLLMSamplingParams())
-    while llm_vllm_engine.has_unfinished_requests():
-        llm_vllm_engine.step()
+    llm_vllm = VLLM(model=path, max_model_len=4096)
+    sampling_params_vllm = [VLLMSamplingParams(**args) for args in sampling_params_args]
+    prompts_vllm = [dict(prompt_token_ids=p) for p in prompt_token_ids_base]
 
+    # Warm-up
+    llm_vllm.generate(["Benchmark: "], VLLMSamplingParams())
+    
     # Timed run
     t_vllm = time.time()
-    
-    # Add all requests to the engine
-    for i in range(num_seqs):
-        prompt = prompt_token_ids_base[i]
-        sampling_params = VLLMSamplingParams(**sampling_params_args[i])
-        request_id = str(i)
-        llm_vllm_engine.add_request(request_id, prompt_token_ids=prompt, sampling_params=sampling_params)
-
-    # Run the engine until all requests are finished
-    outputs = []
-    while llm_vllm_engine.has_unfinished_requests():
-        request_outputs = llm_vllm_engine.step()
-        for output in request_outputs:
-            if output.finished:
-                outputs.append(output)
-    
+    llm_vllm.generate(prompts_vllm, sampling_params_vllm, use_tqdm=False)
     t_vllm = (time.time() - t_vllm)
-
+    
     throughput_vllm = total_tokens / t_vllm
+    del llm_vllm
+
+    print(f"\nNanoVLLM -> Total: {total_tokens}tok, Time: {t_nano:.2f}s, Throughput: {throughput_nano:.2f}tok/s")
     print(f"vLLM -> Total: {total_tokens}tok, Time: {t_vllm:.2f}s, Throughput: {throughput_vllm:.2f}tok/s")
-    del llm_vllm_engine
 
 
 if __name__ == "__main__":
